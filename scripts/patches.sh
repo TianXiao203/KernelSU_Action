@@ -361,6 +361,171 @@ kpm_patch_image() {
 	endgroup
 }
 
+# ====================================================== Droidspaces & NTsync
+
+# Droidspaces is a container runtime for Android. It needs the SysV IPC stack
+# (CONFIG_SYSVIPC plus the IPC namespace), which vendor defconfigs normally
+# leave off. NTsync is the Windows NT synchronisation primitive driver Wine and
+# Proton containers use; it only landed upstream in 6.14, so it is backported
+# here -- driver source plus a lockdep/Kconfig compatibility patch.
+#
+# Both options add fields to structs whose layout Android's frozen GKI ABI pins
+# down, so on 5.10 the kABI fixups below are not optional. They park the new
+# fields in the ANDROID_KABI_RESERVE() padding the structs already carry, which
+# leaves every pre-existing offset *and* both struct sizes byte-identical to a
+# kernel built without these options. Skip them and the tree still compiles --
+# it just no longer matches the ABI the prebuilt vendor modules were built
+# against, and the device hangs on the boot splash.
+#
+#   struct user_struct -- CONFIG_POSIX_MQUEUE's mq_bytes   -> KABI slot 1
+#   struct task_struct -- CONFIG_SYSVIPC's sysvsem/sysvshm -> KABI slots 6-8
+#
+# SUSFS is deliberately not involved here; see ENABLE_SUSFS.
+
+DROIDSPACES_PATCH_BASE=${DROIDSPACES_PATCH_BASE:-https://raw.githubusercontent.com/Goldzxcbug/Droidspaces_Kernel_patch/main}
+
+# The URLs live in config.env so that an upstream move is fixable without a code
+# change; these fallbacks keep the step working with an older profile.
+NTSYNC_BASE_PATCH=${NTSYNC_BASE_PATCH:-${DROIDSPACES_PATCH_BASE}/NTsync/ntsync_base.patch}
+NTSYNC_COMPAT_PATCH=${NTSYNC_COMPAT_PATCH:-${DROIDSPACES_PATCH_BASE}/NTsync/ntsync_compat_android12-5.10.patch}
+DROIDSPACES_KABI_PATCH_5_10=${DROIDSPACES_KABI_PATCH_5_10:-${DROIDSPACES_PATCH_BASE}/GKI/5.10/GKI_5.10_posix.patch}
+DROIDSPACES_KABI_SYSVIPC_PATCH_5_10=${DROIDSPACES_KABI_SYSVIPC_PATCH_5_10:-${DROIDSPACES_PATCH_BASE}/GKI/5.10/GKI-5.10-sysvipc_kabi_6_7_8.patch}
+
+# defconfig_path -- absolute path of the defconfig named by KERNEL_CONFIG.
+#
+# KERNEL_CONFIG is documented, and consumed by build.sh both as
+# arch/$ARCH/configs/$KERNEL_CONFIG and as the `make <name>_defconfig` target,
+# as a path relative to arch/<ARCH>/configs/ -- e.g. "unicorn_merged_defconfig"
+# or "vendor/wayne_defconfig". A kernel-tree-relative or absolute value is
+# accepted too, so that a stray setting cannot quietly send the options below
+# nowhere.
+defconfig_path() {
+	local cfg=${KERNEL_CONFIG:-}
+	[ -n "$cfg" ] || die "KERNEL_CONFIG is unset; cannot enable kernel options"
+	case "$cfg" in
+		/*)     printf '%s' "$cfg" ;;
+		arch/*) printf '%s/%s' "$KERNEL_DIR" "$cfg" ;;
+		*)      printf '%s/arch/%s/configs/%s' "$KERNEL_DIR" "${ARCH:-arm64}" "$cfg" ;;
+	esac
+}
+
+# droidspaces_patch LABEL URL DEST -- download one patch and apply it at the
+# root of the kernel tree.
+droidspaces_patch() {
+	local label=$1 url=$2 dest=$3
+	info "  -> ${label}"
+	fetch "$url" "$dest"
+	( cd "$KERNEL_DIR" && apply_patch "$dest" 1 ) || die "${label} did not apply cleanly.
+       Either KERNEL_CONFIG does not belong to this kernel tree, or something
+       earlier already patched the same hunks.
+       Patch URL: ${url}"
+}
+
+droidspaces_ntsync_apply() {
+	group "Applying Droidspaces & NTsync"
+
+	if ! is_true "${ENABLE_DROIDSPACES:-false}"; then
+		info "Droidspaces is disabled (ENABLE_DROIDSPACES is not 'true'); skipping"
+		endgroup
+		return 0
+	fi
+
+	local kver defconfig
+	kver=$(kernel_version "$KERNEL_DIR") \
+		|| die "cannot read VERSION/PATCHLEVEL from ${KERNEL_DIR}/Makefile"
+	defconfig=$(defconfig_path)
+
+	[ -f "$defconfig" ] || die "defconfig not found: ${defconfig}
+       KERNEL_CONFIG is '${KERNEL_CONFIG}', which is read relative to
+       arch/${ARCH:-arm64}/configs/.
+       Available: $(ls "${KERNEL_DIR}/arch/${ARCH:-arm64}/configs/" | head -20 | tr '\n' ' ')"
+
+	local dir="${WORKSPACE}/droidspaces_patches"
+	rm -rf "$dir"
+	mkdir -p "$dir"
+
+	# -------------------------------------------------------- kABI fixups ---
+	#
+	# The fixups are only needed when *this* build is what switches SYSVIPC and
+	# POSIX_MQUEUE on, since that is what inserts the fields. GKI trees (5.15+)
+	# already enable both in gki_defconfig, so their layout does not change and
+	# there is nothing to fix.
+	if is_true "$(kconf_get "$defconfig" CONFIG_SYSVIPC)"; then
+		info "CONFIG_SYSVIPC is already on in ${KERNEL_CONFIG}; ABI unaffected, no kABI fixup needed"
+	elif ver_ge "$kver" "5.11"; then
+		die "kernel ${kver} needs CONFIG_SYSVIPC switched on, and this repo ships a
+       kABI fixup only for 5.10 and older. Switching it on without one changes
+       struct task_struct, which the prebuilt vendor modules are built against,
+       and the device will not boot.
+       Fixups for other versions, if any: ${DROIDSPACES_PATCH_BASE}/GKI/"
+	else
+		if [ -z "$DROIDSPACES_KABI_PATCH_5_10" ] || [ -z "$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" ]; then
+			die "kernel ${kver} needs the 5.10 kABI fixups, but DROIDSPACES_KABI_PATCH_5_10
+       or DROIDSPACES_KABI_SYSVIPC_PATCH_5_10 is empty. Switching on
+       CONFIG_SYSVIPC / CONFIG_POSIX_MQUEUE without them changes
+       struct task_struct and struct user_struct, and the device will not boot.
+       Set both URLs in ${CONFIG_ENV:-config.env}."
+		fi
+
+		# DROIDSPACES_SLOT names the ANDROID_KABI_RESERVE() set the SYSVIPC
+		# patch claims. Upstream also ships 1_2_3 / 3_4_5 / 5_6_7 for devices
+		# that need a different set; 6_7_8 is the one that fits 5.10. Both
+		# spellings are in use -- "678" in config.env, "6_7_8" in the file name
+		# -- so compare digits only. A mismatch usually means the wrong patch
+		# was swapped in, which builds fine and then fails to boot.
+		local slot_digits url_digits
+		slot_digits=$(printf '%s' "${DROIDSPACES_SLOT:-}" | tr -cd '0-9')
+		url_digits=$(printf '%s' "${DROIDSPACES_KABI_SYSVIPC_PATCH_5_10##*/}" | tr -cd '0-9')
+		if [ -n "$slot_digits" ] && [ -n "$url_digits" ] &&
+			! printf '%s' "$url_digits" | grep -q "$slot_digits"; then
+			warn "DROIDSPACES_SLOT=${DROIDSPACES_SLOT}, but the SYSVIPC patch URL does not mention it:"
+			warn "  ${DROIDSPACES_KABI_SYSVIPC_PATCH_5_10}"
+			warn "double-check which slot set fits kernel ${kver}"
+		fi
+
+		# POSIX_MQUEUE first: it only touches struct user_struct and carries no
+		# dependency on the SYSVIPC hunks.
+		droidspaces_patch "kABI fixup: POSIX_MQUEUE in struct user_struct" \
+			"$DROIDSPACES_KABI_PATCH_5_10" "${dir}/kabi_posix_mqueue.patch"
+		droidspaces_patch "kABI fixup: SYSVIPC in struct task_struct (slots ${DROIDSPACES_SLOT:-6_7_8})" \
+			"$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" "${dir}/kabi_sysvipc.patch"
+	fi
+
+	# ------------------------------------------------------------- NTsync ---
+	if is_true "${ENABLE_NTSYNC:-false}"; then
+		droidspaces_patch "NTsync: driver (drivers/misc/ntsync.c, uapi header)" \
+			"$NTSYNC_BASE_PATCH" "${dir}/ntsync_base.patch"
+		droidspaces_patch "NTsync: ${kver} compat (lockdep API, Kconfig, Makefile)" \
+			"$NTSYNC_COMPAT_PATCH" "${dir}/ntsync_compat.patch"
+	else
+		info "NTsync is disabled (ENABLE_NTSYNC is not 'true'); skipping"
+	fi
+
+	# ------------------------------------------------------------ Kconfig ---
+	#
+	# kconf_enable is idempotent, so an option that config.env's EXTRA_DEFCONFIG
+	# already sets is rewritten rather than duplicated: a defconfig holding two
+	# lines for one symbol resolves last-wins and is a pain to debug.
+	#
+	# CONFIG_IPC_NS depends on CONFIG_SYSVIPC, which is why the CONFIG_IPC_NS=y
+	# that config.env already listed was being dropped silently until now.
+	kconf_set_many "$defconfig" CONFIG_SYSVIPC=y CONFIG_IPC_NS=y
+
+	# Safe to switch on precisely because the fixup above owns the field.
+	kconf_enable "$defconfig" CONFIG_POSIX_MQUEUE
+
+	if is_true "${ENABLE_NTSYNC:-false}"; then
+		kconf_enable "$defconfig" CONFIG_NTSYNC
+	fi
+
+	ok "Droidspaces & NTsync applied (kernel ${kver}, kABI slots ${DROIDSPACES_SLOT:-default})"
+	summary "| Droidspaces | applied (kABI slots \`${DROIDSPACES_SLOT:-6_7_8}\`) |"
+	if is_true "${ENABLE_NTSYNC:-false}"; then
+		summary "| NTsync | applied |"
+	fi
+	endgroup
+}
+
 # --------------------------------------------------------------------- main ---
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
@@ -370,11 +535,20 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		hide_stuff)   hide_stuff_apply ;;
 		hooks)        hooks_patch_apply ;;
 		kpm)          kpm_patch_image "$2" ;;
+		droidspaces)  droidspaces_ntsync_apply ;;
 		all)
 			# Order matters and this is the tested one (4.19 + SukiSU builtin
 			# + SUSFS 1.5.5, no rejects):
 			#   path_umount and the hook patches both key off textual anchors
 			#   in files that SUSFS later rewrites, so they go first.
+			#
+			# Droidspaces/NTsync goes ahead of even those: its kABI hunks match
+			# include/linux/sched.h and include/linux/sched/user.h
+			# byte-for-byte only while those files are still stock, and it is
+			# the one patch set the kernel cannot boot without, so it should be
+			# the first thing to fail loudly if something is wrong.
+			droidspaces_ntsync_apply
+
 			if is_true "${ENABLE_PATH_UMOUNT:-false}"; then path_umount_apply; fi
 
 			# Driven by the *resolved* hook mode, not the raw setting, so that

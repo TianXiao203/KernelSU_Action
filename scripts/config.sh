@@ -65,6 +65,19 @@ declare -A DEFAULTS=(
 	[ENABLE_HIDE_STUFF]="false"
 	[ENABLE_KPM]="false"
 
+	# Patches -- Droidspaces / NTsync. Every key a profile may set has to be
+	# listed here: resolve() only walks DEFAULTS, so a key that is missing from
+	# this array is never read from the config file and never exported to the
+	# later steps, which makes it look like the option is being ignored.
+	[ENABLE_DROIDSPACES]="false"
+	[DROIDSPACES_SLOT]=""
+	[ENABLE_NTSYNC]="false"
+	[DROIDSPACES_PATCH_BASE]=""
+	[NTSYNC_BASE_PATCH]=""
+	[NTSYNC_COMPAT_PATCH]=""
+	[DROIDSPACES_KABI_PATCH_5_10]=""
+	[DROIDSPACES_KABI_SYSVIPC_PATCH_5_10]=""
+
 	# Kconfig tweaks
 	[ADD_KPROBES_CONFIG]="false"
 	[ADD_OVERLAYFS_CONFIG]="false"
