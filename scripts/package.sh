@@ -38,7 +38,30 @@ make_anykernel3() {
 		# ro.product.device, and the zip is flashed deliberately by its builder.
 		sed -i 's/do.devicecheck=1/do.devicecheck=0/g' "${AK3}/anykernel.sh"
 		sed -i 's!BLOCK=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;!BLOCK=auto;!g' "${AK3}/anykernel.sh"
-		sed -i 's/IS_SLOT_DEVICE=0;/is_slot_device=auto;/g' "${AK3}/anykernel.sh"
+
+		# ak3-core.sh reads $IS_SLOT_DEVICE -- upper case. Rewriting the name to
+		# lower case here (as this used to) leaves that variable unset, which
+		# silently disables slot detection: SLOT stays empty, the partition
+		# search then only tries unsuffixed names, and on an A/B device -- where
+		# boot_a/boot_b exist but plain "boot" does not -- it gives up with
+		# "Unable to determine auto partition. Aborting..."
+		#
+		# Verified on unicorn (SM8450, active slot _b): with SLOT empty the
+		# probe finds nothing; with SLOT=_b it resolves /dev/block/by-name/boot_b.
+		sed -i 's/IS_SLOT_DEVICE=0;/IS_SLOT_DEVICE=auto;/g' "${AK3}/anykernel.sh"
+
+		# All three seds key off exact upstream text. If osm0sis changes the
+		# template they stop matching and the stock Galaxy Nexus values survive,
+		# producing a zip that cannot install on anything. Catch that here, where
+		# the cause is obvious, instead of at flash time.
+		local want
+		for want in "do.devicecheck=0" "BLOCK=auto;" "IS_SLOT_DEVICE=auto;"; do
+			grep -qF "$want" "${AK3}/anykernel.sh" \
+				|| die "after patching, AnyKernel3's anykernel.sh does not contain '${want}'.
+       Upstream (osm0sis/AnyKernel3) must have changed the template; update the
+       seds in make_anykernel3() to match it, otherwise this zip ships with the
+       stock values and cannot install."
+		done
 	fi
 
 	cp "${BOOT_OUT}/${KERNEL_IMAGE_NAME}" "${AK3}/" \
