@@ -103,6 +103,76 @@ make_args() {
 	fi
 }
 
+# ------------------------------------------------------- config fragments ---
+
+# merge_config_fragments -- apply arch/arm64/configs/vendor/*.config on top of
+# the .config the defconfig target just produced.
+#
+# On a GKI tree gki_defconfig carries only the core. The SoC and device options
+# live in fragments under arch/arm64/configs/vendor/ and are merged on top by
+# the ROM's own build (build.config + merge_config.sh). Skipping them still
+# gives a kernel that compiles -- just one with no SoC support whatsoever: no
+# ARCH_WAIPIO, no UFS controller, no clocks, no regulators, no zram, and none of
+# the vendor modules the ROM's user space expects. It hangs on the first splash
+# screen without printing anything, which is a miserable thing to debug from a
+# CI log.
+#
+# The fragments go on AFTER the defconfig target because that is the only order
+# in which a fragment can win over a value baked into the defconfig -- and the
+# same order the ROM uses. `-m` tells merge_config.sh to stop before running
+# make, so olddefconfig is issued here to resolve the new dependencies.
+merge_config_fragments() {
+	[ -n "${KERNEL_CONFIG_FRAGMENTS:-}" ] || return 0
+
+	group "Merging kernel config fragments"
+
+	local f frags=() args
+	args=$(make_args)
+	for f in ${KERNEL_CONFIG_FRAGMENTS}; do
+		if [ -f "${KERNEL_DIR}/${f}" ]; then
+			frags+=("${KERNEL_DIR}/${f}")
+			info "  + ${f}"
+		else
+			warn "config fragment not found: ${f}"
+		fi
+	done
+	[ "${#frags[@]}" -gt 0 ] || die "none of the KERNEL_CONFIG_FRAGMENTS exist under ${KERNEL_DIR}"
+
+	[ -x "${KERNEL_DIR}/scripts/kconfig/merge_config.sh" ] \
+		|| die "${KERNEL_DIR}/scripts/kconfig/merge_config.sh is missing; cannot merge fragments"
+
+	"${KERNEL_DIR}/scripts/kconfig/merge_config.sh" -m -O "${KERNEL_DIR}/out" \
+		"${KERNEL_DIR}/out/.config" "${frags[@]}" \
+		|| die "merge_config.sh failed"
+
+	cd "$KERNEL_DIR"
+	# shellcheck disable=SC2086
+	make -j"$(nproc --all)" CC=clang $args olddefconfig \
+		|| die "olddefconfig failed after merging the config fragments"
+
+	# A fragment that silently failed to apply would hand back exactly the same
+	# unbootable kernel as not merging at all, so check the end state instead of
+	# trusting the merge. These are the options this build exists for.
+	local required="" sym missing=""
+	if is_true "${ENABLE_DROIDSPACES:-false}"; then
+		required="${required} CONFIG_SYSVIPC=y CONFIG_IPC_NS=y CONFIG_POSIX_MQUEUE=y"
+	fi
+	if is_true "${ENABLE_NTSYNC:-false}"; then
+		required="${required} CONFIG_NTSYNC=y"
+	fi
+	if [ "${KSU_VARIANT:-none}" != "none" ]; then
+		required="${required} CONFIG_KSU=y"
+	fi
+	for sym in $required; do
+		grep -qx "$sym" "${KERNEL_DIR}/out/.config" || missing="${missing} ${sym}"
+	done
+	[ -z "$missing" ] || die "these options are missing from out/.config after merging:${missing}
+       A fragment probably did not apply, or KERNEL_CONFIG_FRAGMENTS is incomplete."
+
+	ok "merged ${#frags[@]} fragment(s)"
+	endgroup
+}
+
 build_kernel() {
 	group "Building kernel"
 	export PATH="${CLANG_PATH:-}:${PATH}"
@@ -136,6 +206,8 @@ build_kernel() {
 	# shellcheck disable=SC2086
 	make -j"$(nproc --all)" CC=clang $args "${KERNEL_CONFIG}" \
 		|| die "defconfig generation failed"
+
+	merge_config_fragments
 
 	info "make ${args}"
 	# shellcheck disable=SC2086
