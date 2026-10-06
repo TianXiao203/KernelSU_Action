@@ -152,10 +152,10 @@ merge_config_fragments() {
 
 	# A fragment that silently failed to apply would hand back exactly the same
 	# unbootable kernel as not merging at all, so check the end state instead of
-	# trusting the merge. These are the options this build exists for.
-	local required="" sym missing=""
+	# trusting the merge.
+	local required="" forbidden="" sym missing="" bad=""
 	if is_true "${ENABLE_DROIDSPACES:-false}"; then
-		required="${required} CONFIG_SYSVIPC=y CONFIG_IPC_NS=y CONFIG_POSIX_MQUEUE=y"
+		required="${required} CONFIG_IPC_NS=y CONFIG_POSIX_MQUEUE=y"
 	fi
 	if is_true "${ENABLE_NTSYNC:-false}"; then
 		required="${required} CONFIG_NTSYNC=y"
@@ -169,7 +169,57 @@ merge_config_fragments() {
 	[ -z "$missing" ] || die "these options are missing from out/.config after merging:${missing}
        A fragment probably did not apply, or KERNEL_CONFIG_FRAGMENTS is incomplete."
 
+	# Options that provably move symbol CRCs on this tree, which makes the ROM's
+	# prebuilt vendor modules refuse to load. A kernel carrying any of them
+	# compiles perfectly and then parks on the boot logo for ever -- no panic, no
+	# dmesg, empty pstore -- so refuse to build it in the first place.
+	forbidden="CONFIG_SYSVIPC CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS CONFIG_NF_TABLES CONFIG_BRIDGE_NETFILTER"
+	for sym in $forbidden; do
+		if grep -qx "${sym}=y" "${KERNEL_DIR}/out/.config"; then
+			bad="${bad} ${sym}"
+		fi
+	done
+	[ -z "$bad" ] || die "these options are on and each one breaks the GKI ABI:${bad}
+       Every one of them changes a struct layout the ROM's vendor modules were
+       compiled against, so those modules refuse to load and the device hangs on
+       the boot logo. Remove them from EXTRA_DEFCONFIG / KERNEL_CONFIG_FRAGMENTS.
+       The reasons per option are documented above EXTRA_DEFCONFIG in config.env."
+
 	ok "merged ${#frags[@]} fragment(s)"
+	endgroup
+}
+
+# check_module_abi -- compare our kernel's symbol CRCs with the ones the ROM's
+# prebuilt vendor modules were compiled against.
+#
+# Android compiles the kernel and its vendor modules separately: each module
+# records the CRC it expects for every kernel symbol it uses, and the kernel
+# refuses to load a module whose CRCs differ. Those CRCs come from genksyms over
+# the *type definitions*, so one changed struct layout silently invalidates
+# hundreds of them -- and the symptom is not a panic but a screen that stays on
+# the boot logo for ever, with nothing in pstore to explain it.
+#
+# The baseline is abi-baseline/abi-crcs.txt, generated from the .ko files on the
+# device. Failing here costs one CI run; not failing here costs a flash cycle and
+# a device that looks bricked.
+check_module_abi() {
+	local repo_root checker baseline
+	repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+	checker="${repo_root}/scripts/check-abi-crc.py"
+	baseline="${repo_root}/abi-baseline/abi-crcs.txt"
+
+	[ -f "$baseline" ] || { info "no ABI baseline in the repo; skipping the module ABI check"; return 0; }
+	[ -f "$checker" ] || { warn "ABI baseline is present but ${checker} is missing; skipping the check"; return 0; }
+	[ -f "${OUT}/Module.symvers" ] || die "no Module.symvers at ${OUT}/Module.symvers to check the ABI against"
+
+	group "Checking the module ABI against the ROM baseline"
+	if ! python3 "$checker" check "${OUT}/Module.symvers" -b "$baseline"; then
+		die "the kernel ABI no longer matches the ROM's vendor modules (list above).
+       Flashing this would leave the device parked on the boot logo with no log
+       at all. Drop whichever option moved the CRCs; the per-option reasoning is
+       in the comment above EXTRA_DEFCONFIG in config.env."
+	fi
+	ok "kernel ABI matches the ROM baseline"
 	endgroup
 }
 
@@ -213,6 +263,8 @@ build_kernel() {
 	# shellcheck disable=SC2086
 	make -j"$(nproc --all)" CC="$cc" $args \
 		|| die "kernel build failed"
+
+	check_module_abi
 
 	endgroup
 }

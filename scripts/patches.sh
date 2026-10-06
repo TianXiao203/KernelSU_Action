@@ -446,49 +446,46 @@ droidspaces_ntsync_apply() {
 
 	# -------------------------------------------------------- kABI fixups ---
 	#
-	# The fixups are only needed when *this* build is what switches SYSVIPC and
-	# POSIX_MQUEUE on, since that is what inserts the fields. GKI trees (5.15+)
-	# already enable both in gki_defconfig, so their layout does not change and
-	# there is nothing to fix.
-	if is_true "$(kconf_get "$defconfig" CONFIG_SYSVIPC)"; then
-		info "CONFIG_SYSVIPC is already on in ${KERNEL_CONFIG}; ABI unaffected, no kABI fixup needed"
+	# The fixup is needed when *this* build is what switches POSIX_MQUEUE on,
+	# because that is what inserts user_struct.mq_bytes. It moves the member into
+	# the ANDROID_KABI_RESERVE() slot the struct already carries, so genksyms
+	# still sees `u64 android_kabi_reserved1;` -- the same text as the ROM -- and
+	# the CRC does not move. Measured on this tree: without the fixup it is 725
+	# exported symbols.
+	#
+	# On 5.15+ GKI trees gki_defconfig already enables POSIX_MQUEUE, so the
+	# layout already accounts for it and there is nothing to do.
+	if is_true "$(kconf_get "$defconfig" CONFIG_POSIX_MQUEUE)"; then
+		info "CONFIG_POSIX_MQUEUE is already on in ${KERNEL_CONFIG}; ABI already accounts for it, no kABI fixup needed"
 	elif ver_ge "$kver" "5.11"; then
-		die "kernel ${kver} needs CONFIG_SYSVIPC switched on, and this repo ships a
-       kABI fixup only for 5.10 and older. Switching it on without one changes
-       struct task_struct, which the prebuilt vendor modules are built against,
-       and the device will not boot.
+		die "kernel ${kver} needs CONFIG_POSIX_MQUEUE switched on -- it is the
+       dependency this build uses to get CONFIG_IPC_NS -- and this repo ships a
+       kABI fixup only for 5.10 and older. Switching it on without the fixup
+       adds mq_bytes to struct user_struct, which moved 725 exported symbol CRCs
+       when measured here, and the kernel then hangs on the boot logo with no
+       log at all.
        Fixups for other versions, if any: ${DROIDSPACES_PATCH_BASE}/GKI/"
 	else
-		if [ -z "$DROIDSPACES_KABI_PATCH_5_10" ] || [ -z "$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" ]; then
-			die "kernel ${kver} needs the 5.10 kABI fixups, but DROIDSPACES_KABI_PATCH_5_10
-       or DROIDSPACES_KABI_SYSVIPC_PATCH_5_10 is empty. Switching on
-       CONFIG_SYSVIPC / CONFIG_POSIX_MQUEUE without them changes
-       struct task_struct and struct user_struct, and the device will not boot.
-       Set both URLs in ${CONFIG_ENV:-config.env}."
+		if [ -z "$DROIDSPACES_KABI_PATCH_5_10" ]; then
+			die "kernel ${kver} needs the POSIX_MQUEUE kABI fixup, but
+       DROIDSPACES_KABI_PATCH_5_10 is empty. Switching CONFIG_POSIX_MQUEUE on
+       without it changes struct user_struct, and the device will not boot.
+       Set the URL in ${CONFIG_ENV:-config.env}."
 		fi
 
-		# DROIDSPACES_SLOT names the ANDROID_KABI_RESERVE() set the SYSVIPC
-		# patch claims. Upstream also ships 1_2_3 / 3_4_5 / 5_6_7 for devices
-		# that need a different set; 6_7_8 is the one that fits 5.10. Both
-		# spellings are in use -- "678" in config.env, "6_7_8" in the file name
-		# -- so compare digits only. A mismatch usually means the wrong patch
-		# was swapped in, which builds fine and then fails to boot.
-		local slot_digits url_digits
-		slot_digits=$(printf '%s' "${DROIDSPACES_SLOT:-}" | tr -cd '0-9')
-		url_digits=$(printf '%s' "${DROIDSPACES_KABI_SYSVIPC_PATCH_5_10##*/}" | tr -cd '0-9')
-		if [ -n "$slot_digits" ] && [ -n "$url_digits" ] &&
-			! printf '%s' "$url_digits" | grep -q "$slot_digits"; then
-			warn "DROIDSPACES_SLOT=${DROIDSPACES_SLOT}, but the SYSVIPC patch URL does not mention it:"
-			warn "  ${DROIDSPACES_KABI_SYSVIPC_PATCH_5_10}"
-			warn "double-check which slot set fits kernel ${kver}"
-		fi
-
-		# POSIX_MQUEUE first: it only touches struct user_struct and carries no
-		# dependency on the SYSVIPC hunks.
 		droidspaces_patch "kABI fixup: POSIX_MQUEUE in struct user_struct" \
 			"$DROIDSPACES_KABI_PATCH_5_10" "${dir}/kabi_posix_mqueue.patch"
-		droidspaces_patch "kABI fixup: SYSVIPC in struct task_struct (slots ${DROIDSPACES_SLOT:-6_7_8})" \
-			"$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" "${dir}/kabi_sysvipc.patch"
+
+		# CONFIG_SYSVIPC is deliberately left off (see the Kconfig section at
+		# the end of this function), so this fixup is inert: every hunk lands in
+		# its #else branch and the reserve slots stay exactly as the ROM has
+		# them. It is applied anyway so that the option can be switched on later
+		# without rediscovering the dependency -- but only once the ABI check in
+		# build.sh still comes back green with it.
+		if [ -n "$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" ]; then
+			droidspaces_patch "kABI fixup: SYSVIPC in struct task_struct (inert while SYSVIPC off)" \
+				"$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" "${dir}/kabi_sysvipc.patch"
+		fi
 	fi
 
 	# ------------------------------------------------------------- NTsync ---
@@ -507,12 +504,30 @@ droidspaces_ntsync_apply() {
 	# already sets is rewritten rather than duplicated: a defconfig holding two
 	# lines for one symbol resolves last-wins and is a pain to debug.
 	#
-	# CONFIG_IPC_NS depends on CONFIG_SYSVIPC, which is why the CONFIG_IPC_NS=y
-	# that config.env already listed was being dropped silently until now.
-	kconf_set_many "$defconfig" CONFIG_SYSVIPC=y CONFIG_IPC_NS=y
-
-	# Safe to switch on precisely because the fixup above owns the field.
-	kconf_enable "$defconfig" CONFIG_POSIX_MQUEUE
+	# CONFIG_IPC_NS is `depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)`, so
+	# there are two routes to a container IPC namespace and the choice is not
+	# cosmetic:
+	#
+	#   SYSVIPC       puts struct sysv_sem and struct sysv_shm back into
+	#                 struct task_struct. There is a kABI fixup for that too, but
+	#                 task_struct is the widest struct in the kernel, so this is
+	#                 the route that has never been ABI-verified on this device.
+	#   POSIX_MQUEUE  puts mq_bytes back into struct user_struct -- the field the
+	#                 fixup above owns. Measured green against the ROM's 395
+	#                 prebuilt vendor modules; this is what the working
+	#                 configuration uses.
+	#
+	# Either option has to be ON, or IPC_NS is not merely disabled -- the symbol
+	# does not exist at all and containers get no IPC namespace.
+	#
+	# config.env's EXTRA_DEFCONFIG lists CONFIG_IPC_NS=y as well (it used to be
+	# dropped silently for exactly this dependency reason, and that is also where
+	# the ABI-sensitive option set is documented). Setting them here keeps
+	# Droidspaces self-contained.
+	kconf_set_many "$defconfig" \
+		CONFIG_IPC_NS=y \
+		CONFIG_POSIX_MQUEUE=y \
+		CONFIG_POSIX_MQUEUE_SYSCTL=y
 
 	if is_true "${ENABLE_NTSYNC:-false}"; then
 		kconf_enable "$defconfig" CONFIG_NTSYNC
