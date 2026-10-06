@@ -446,46 +446,73 @@ droidspaces_ntsync_apply() {
 
 	# -------------------------------------------------------- kABI fixups ---
 	#
-	# The fixup is needed when *this* build is what switches POSIX_MQUEUE on,
-	# because that is what inserts user_struct.mq_bytes. It moves the member into
-	# the ANDROID_KABI_RESERVE() slot the struct already carries, so genksyms
-	# still sees `u64 android_kabi_reserved1;` -- the same text as the ROM -- and
-	# the CRC does not move. Measured on this tree: without the fixup it is 725
-	# exported symbols.
+	# Both fixups are needed, because both options end up on. SYSVIPC is the one
+	# Droidspaces asks for, and POSIX_MQUEUE comes with it for free -- its Kconfig
+	# is `depends on SYSVIPC` with `default y`. Each inserts a field no vendor
+	# kernel ever had:
 	#
-	# On 5.15+ GKI trees gki_defconfig already enables POSIX_MQUEUE, so the
-	# layout already accounts for it and there is nothing to do.
+	#   struct user_struct.mq_bytes -> ANDROID_KABI_RESERVE(1)
+	#       Without the fixup this is 725 exported symbol CRCs on this tree;
+	#       user_struct is reachable from task/file/socket through cred.user.
+	#   struct task_struct.sysvsem / .sysvshm -> slots 6 and 7-8
+	#       task_struct is the widest struct in the kernel, so this carries the
+	#       largest blast radius of anything this action switches on.
+	#
+	# The trick works because genksyms reads _ANDROID_KABI_REPLACE() as its _orig
+	# argument alone (see the __GENKSYMS__ branch of include/linux/android_kabi.h),
+	# so the text a CRC is computed over stays literally
+	# `u64 android_kabi_reservedN;` -- byte-identical to the ROM. The real layout is
+	# unchanged too: struct sysv_sem is one pointer, struct sysv_shm one list_head,
+	# and two reserve slots are exactly the 16 bytes those need.
+	#
+	# On 5.15+ GKI trees gki_defconfig already enables both, so the layout already
+	# accounts for them and there is nothing to do.
+	local need_fixup=true
 	if is_true "$(kconf_get "$defconfig" CONFIG_POSIX_MQUEUE)"; then
-		info "CONFIG_POSIX_MQUEUE is already on in ${KERNEL_CONFIG}; ABI already accounts for it, no kABI fixup needed"
+		need_fixup=false
+	fi
+
+	if [ "$need_fixup" = "false" ]; then
+		info "CONFIG_POSIX_MQUEUE is already on in ${KERNEL_CONFIG}; the ABI already accounts for it, no kABI fixup needed"
 	elif ver_ge "$kver" "5.11"; then
-		die "kernel ${kver} needs CONFIG_POSIX_MQUEUE switched on -- it is the
-       dependency this build uses to get CONFIG_IPC_NS -- and this repo ships a
-       kABI fixup only for 5.10 and older. Switching it on without the fixup
-       adds mq_bytes to struct user_struct, which moved 725 exported symbol CRCs
-       when measured here, and the kernel then hangs on the boot logo with no
-       log at all.
+		die "kernel ${kver} needs CONFIG_SYSVIPC and CONFIG_POSIX_MQUEUE switched
+       on, and this repo ships their kABI fixups only for 5.10 and older.
+       Switching them on without a fixup adds mq_bytes to struct user_struct and
+       sysvsem/sysvshm to struct task_struct -- 725 exported symbol CRCs and more
+       on this tree -- and the kernel then hangs on the boot logo with no log at
+       all.
        Fixups for other versions, if any: ${DROIDSPACES_PATCH_BASE}/GKI/"
 	else
-		if [ -z "$DROIDSPACES_KABI_PATCH_5_10" ]; then
-			die "kernel ${kver} needs the POSIX_MQUEUE kABI fixup, but
-       DROIDSPACES_KABI_PATCH_5_10 is empty. Switching CONFIG_POSIX_MQUEUE on
-       without it changes struct user_struct, and the device will not boot.
-       Set the URL in ${CONFIG_ENV:-config.env}."
+		if [ -z "$DROIDSPACES_KABI_PATCH_5_10" ] || [ -z "$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" ]; then
+			die "kernel ${kver} needs both 5.10 kABI fixups, but
+       DROIDSPACES_KABI_PATCH_5_10 or DROIDSPACES_KABI_SYSVIPC_PATCH_5_10 is
+       empty. Switching SYSVIPC / POSIX_MQUEUE on without them changes
+       struct task_struct and struct user_struct, and the device will not boot.
+       Set both URLs in ${CONFIG_ENV:-config.env}."
 		fi
 
+		# DROIDSPACES_SLOT names the ANDROID_KABI_RESERVE() set the SYSVIPC patch
+		# claims. Upstream also ships 1_2_3 / 3_4_5 / 5_6_7 for the devices that
+		# need a different set; 6_7_8 is the one that fits 5.10. Both spellings are
+		# in use -- "678" in config.env, "6_7_8" in the file name -- so compare
+		# digits only. A mismatch usually means the wrong patch was swapped in,
+		# which builds fine and then fails to boot.
+		local slot_digits url_digits
+		slot_digits=$(printf '%s' "${DROIDSPACES_SLOT:-}" | tr -cd '0-9')
+		url_digits=$(printf '%s' "${DROIDSPACES_KABI_SYSVIPC_PATCH_5_10##*/}" | tr -cd '0-9')
+		if [ -n "$slot_digits" ] && [ -n "$url_digits" ] &&
+			! printf '%s' "$url_digits" | grep -q "$slot_digits"; then
+			warn "DROIDSPACES_SLOT=${DROIDSPACES_SLOT}, but the SYSVIPC patch URL does not mention it:"
+			warn "  ${DROIDSPACES_KABI_SYSVIPC_PATCH_5_10}"
+			warn "double-check which slot set fits kernel ${kver}"
+		fi
+
+		# POSIX_MQUEUE first: it only touches struct user_struct and carries no
+		# dependency on the SYSVIPC hunks.
 		droidspaces_patch "kABI fixup: POSIX_MQUEUE in struct user_struct" \
 			"$DROIDSPACES_KABI_PATCH_5_10" "${dir}/kabi_posix_mqueue.patch"
-
-		# CONFIG_SYSVIPC is deliberately left off (see the Kconfig section at
-		# the end of this function), so this fixup is inert: every hunk lands in
-		# its #else branch and the reserve slots stay exactly as the ROM has
-		# them. It is applied anyway so that the option can be switched on later
-		# without rediscovering the dependency -- but only once the ABI check in
-		# build.sh still comes back green with it.
-		if [ -n "$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" ]; then
-			droidspaces_patch "kABI fixup: SYSVIPC in struct task_struct (inert while SYSVIPC off)" \
-				"$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" "${dir}/kabi_sysvipc.patch"
-		fi
+		droidspaces_patch "kABI fixup: SYSVIPC in struct task_struct (slots ${DROIDSPACES_SLOT:-6_7_8})" \
+			"$DROIDSPACES_KABI_SYSVIPC_PATCH_5_10" "${dir}/kabi_sysvipc.patch"
 	fi
 
 	# ------------------------------------------------------------- NTsync ---
@@ -504,27 +531,21 @@ droidspaces_ntsync_apply() {
 	# already sets is rewritten rather than duplicated: a defconfig holding two
 	# lines for one symbol resolves last-wins and is a pain to debug.
 	#
-	# CONFIG_IPC_NS is `depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)`, so
-	# there are two routes to a container IPC namespace and the choice is not
-	# cosmetic:
+	# SYSVIPC is what Droidspaces actually needs -- a container running PostgreSQL,
+	# or a Wine/Proton title, calls shmget/semget/msgget directly -- and it is also
+	# what makes IPC_NS reachable at all:
+	#   config IPC_NS
+	#       depends on NAMESPACES && (SYSVIPC || POSIX_MQUEUE)
+	# With neither option the symbol does not exist, so containers get no IPC
+	# namespace either. The kABI fixup above is the only reason switching it on is
+	# ABI-safe, and build.sh re-checks that the fixup really is in the tree before
+	# it compiles.
 	#
-	#   SYSVIPC       puts struct sysv_sem and struct sysv_shm back into
-	#                 struct task_struct. There is a kABI fixup for that too, but
-	#                 task_struct is the widest struct in the kernel, so this is
-	#                 the route that has never been ABI-verified on this device.
-	#   POSIX_MQUEUE  puts mq_bytes back into struct user_struct -- the field the
-	#                 fixup above owns. Measured green against the ROM's 395
-	#                 prebuilt vendor modules; this is what the working
-	#                 configuration uses.
-	#
-	# Either option has to be ON, or IPC_NS is not merely disabled -- the symbol
-	# does not exist at all and containers get no IPC namespace.
-	#
-	# config.env's EXTRA_DEFCONFIG lists CONFIG_IPC_NS=y as well (it used to be
-	# dropped silently for exactly this dependency reason, and that is also where
-	# the ABI-sensitive option set is documented). Setting them here keeps
-	# Droidspaces self-contained.
+	# POSIX_MQUEUE comes along on its own (default y under SYSVIPC) and is listed
+	# explicitly so the second kABI fixup cannot be skipped by a profile that trims
+	# this list down.
 	kconf_set_many "$defconfig" \
+		CONFIG_SYSVIPC=y \
 		CONFIG_IPC_NS=y \
 		CONFIG_POSIX_MQUEUE=y \
 		CONFIG_POSIX_MQUEUE_SYSCTL=y

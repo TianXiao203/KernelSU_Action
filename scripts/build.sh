@@ -153,9 +153,24 @@ merge_config_fragments() {
 	# A fragment that silently failed to apply would hand back exactly the same
 	# unbootable kernel as not merging at all, so check the end state instead of
 	# trusting the merge.
-	local required="" forbidden="" sym missing="" bad=""
+	local required="" sym missing="" mnote="" bad=""
 	if is_true "${ENABLE_DROIDSPACES:-false}"; then
-		required="${required} CONFIG_IPC_NS=y CONFIG_POSIX_MQUEUE=y"
+		# SYSVIPC belongs in this list: Droidspaces gives containers a real SysV IPC
+		# namespace, and IPC_NS is `depends on NAMESPACES && (SYSVIPC ||
+		# POSIX_MQUEUE)`, so with neither of them the symbol does not exist at all.
+		# patches.sh applies the kABI fixups that make both ABI-safe; the checks
+		# further down verify the fixups are really in the tree.
+		required="${required} CONFIG_SYSVIPC=y CONFIG_IPC_NS=y"
+		required="${required} CONFIG_POSIX_MQUEUE=y CONFIG_POSIX_MQUEUE_SYSCTL=y"
+		# Container networking, UFW (addrtype / REJECT / LOG) and fail2ban (ipset,
+		# recent). All leaf options -- no exported symbol's type can reach them.
+		required="${required} CONFIG_DEVTMPFS=y CONFIG_TMPFS_XATTR=y"
+		required="${required} CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y"
+		required="${required} CONFIG_NETFILTER_XT_TARGET_LOG=y"
+		required="${required} CONFIG_NETFILTER_XT_MATCH_RECENT=y"
+		required="${required} CONFIG_IP_NF_TARGET_REJECT=y CONFIG_IP6_NF_TARGET_REJECT=y"
+		required="${required} CONFIG_IP_SET=y CONFIG_IP_SET_HASH_IP=y CONFIG_IP_SET_HASH_NET=y"
+		required="${required} CONFIG_NETFILTER_XT_SET=y"
 	fi
 	if is_true "${ENABLE_NTSYNC:-false}"; then
 		required="${required} CONFIG_NTSYNC=y"
@@ -164,8 +179,20 @@ merge_config_fragments() {
 		required="${required} CONFIG_KSU=y"
 	fi
 	for sym in $required; do
-		grep -qx "$sym" "${KERNEL_DIR}/out/.config" || missing="${missing} ${sym}"
+		if grep -qx "$sym" "${KERNEL_DIR}/out/.config"; then
+			continue
+		fi
+		missing="${missing} ${sym}"
+		# =m rather than =y is a distinct kind of wrong: package.sh puts only Image
+		# in the AnyKernel3 zip, so a driver built as a module is not on the device
+		# at all and the option silently does nothing.
+		if grep -qx "${sym%=*}=m" "${KERNEL_DIR}/out/.config"; then
+			mnote="${mnote} ${sym%=*}"
+		fi
 	done
+	[ -z "$mnote" ] || die "these options resolved to =m instead of =y:${mnote}
+       The AnyKernel3 zip carries only Image, so a module is not on the device at
+       all and the option silently does nothing. Give it =y in EXTRA_DEFCONFIG."
 	[ -z "$missing" ] || die "these options are missing from out/.config after merging:${missing}
        A fragment probably did not apply, or KERNEL_CONFIG_FRAGMENTS is incomplete."
 
@@ -173,8 +200,8 @@ merge_config_fragments() {
 	# prebuilt vendor modules refuse to load. A kernel carrying any of them
 	# compiles perfectly and then parks on the boot logo for ever -- no panic, no
 	# dmesg, empty pstore -- so refuse to build it in the first place.
-	forbidden="CONFIG_SYSVIPC CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS CONFIG_NF_TABLES CONFIG_BRIDGE_NETFILTER"
-	for sym in $forbidden; do
+	for sym in CONFIG_CGROUP_DEVICE CONFIG_CGROUP_PIDS CONFIG_NF_TABLES \
+	           CONFIG_BRIDGE_NETFILTER CONFIG_BLK_DEV_THROTTLING CONFIG_CFS_BANDWIDTH; do
 		if grep -qx "${sym}=y" "${KERNEL_DIR}/out/.config"; then
 			bad="${bad} ${sym}"
 		fi
@@ -184,6 +211,27 @@ merge_config_fragments() {
        compiled against, so those modules refuse to load and the device hangs on
        the boot logo. Remove them from EXTRA_DEFCONFIG / KERNEL_CONFIG_FRAGMENTS.
        The reasons per option are documented above EXTRA_DEFCONFIG in config.env."
+
+	# SYSVIPC and POSIX_MQUEUE are allowed -- but only together with the kABI
+	# fixups, which park their new members in the ANDROID_KABI_RESERVE() slots
+	# genksyms already reads as `u64 android_kabi_reservedN`. Without the fixup
+	# those two options move 725 exported symbol CRCs and more, so verify the
+	# fixup is really in the tree rather than trusting that patches.sh ran.
+	if grep -qx "CONFIG_SYSVIPC=y" "${KERNEL_DIR}/out/.config"; then
+		if ! grep -q "ANDROID_KABI_USE(6, struct sysv_sem sysvsem)" "${KERNEL_DIR}/include/linux/sched.h"; then
+			bad="${bad} CONFIG_SYSVIPC(no task_struct kABI fixup)"
+		fi
+	fi
+	if grep -qx "CONFIG_POSIX_MQUEUE=y" "${KERNEL_DIR}/out/.config"; then
+		if ! grep -q "ANDROID_KABI_USE(1, unsigned long mq_bytes)" "${KERNEL_DIR}/include/linux/sched/user.h"; then
+			bad="${bad} CONFIG_POSIX_MQUEUE(no user_struct kABI fixup)"
+		fi
+	fi
+	[ -z "$bad" ] || die "the kABI fixups these options depend on are not in place:${bad}
+       Run scripts/patches.sh first: it applies the two kABI patches that move the
+       new fields into the ANDROID_KABI_RESERVE() padding. Without them these
+       options are not merely risky -- they change struct layouts the ROM's vendor
+       modules were built against, and the device will not boot."
 
 	ok "merged ${#frags[@]} fragment(s)"
 	endgroup
