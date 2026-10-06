@@ -209,7 +209,9 @@ merge_config_fragments() {
 	[ -z "$bad" ] || die "these options are on and each one breaks the GKI ABI:${bad}
        Every one of them changes a struct layout the ROM's vendor modules were
        compiled against, so those modules refuse to load and the device hangs on
-       the boot logo. Remove them from EXTRA_DEFCONFIG / KERNEL_CONFIG_FRAGMENTS.
+       the boot logo. unicorn_merged_defconfig ships most of them switched on,
+       so EXTRA_DEFCONFIG has to turn them back off with =n; omitting them is not
+       enough. The per-option reasoning is above EXTRA_DEFCONFIG in config.env.
        The reasons per option are documented above EXTRA_DEFCONFIG in config.env."
 
 	# SYSVIPC and POSIX_MQUEUE are allowed -- but only together with the kABI

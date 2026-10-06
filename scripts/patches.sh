@@ -447,8 +447,9 @@ droidspaces_ntsync_apply() {
 	# -------------------------------------------------------- kABI fixups ---
 	#
 	# Both fixups are needed, because both options end up on. SYSVIPC is the one
-	# Droidspaces asks for, and POSIX_MQUEUE comes with it for free -- its Kconfig
-	# is `depends on SYSVIPC` with `default y`. Each inserts a field no vendor
+	# Droidspaces asks for; POSIX_MQUEUE is switched on alongside it, and on this
+	# tree the two are independent -- POSIX_MQUEUE depends on NET, not on
+	# SYSVIPC -- so each one needs its own fixup. Each inserts a field no vendor
 	# kernel ever had:
 	#
 	#   struct user_struct.mq_bytes -> ANDROID_KABI_RESERVE(1)
@@ -541,9 +542,9 @@ droidspaces_ntsync_apply() {
 	# ABI-safe, and build.sh re-checks that the fixup really is in the tree before
 	# it compiles.
 	#
-	# POSIX_MQUEUE comes along on its own (default y under SYSVIPC) and is listed
-	# explicitly so the second kABI fixup cannot be skipped by a profile that trims
-	# this list down.
+	# POSIX_MQUEUE is listed explicitly rather than left implied: on this tree it is
+	# independent of SYSVIPC, so a profile that trimmed this list could otherwise
+	# switch one option on and skip the kABI fixup that belongs with it.
 	kconf_set_many "$defconfig" \
 		CONFIG_SYSVIPC=y \
 		CONFIG_IPC_NS=y \
